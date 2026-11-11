@@ -1,0 +1,1337 @@
+---
+title: "QBS 181 Final project"
+author: "Hellarine Wu"
+date: "2026-11-11"
+output: html_document
+---
+# Insert packages
+```{r}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(tigris)
+library(sf)
+```
+
+# Data Cleaning
+```{r}
+#step 1, insert datasets. We will use the county level data as the analysis file. 
+natality_raw <- read_excel(
+  "/Users/hellarinewu/Desktop/QBS 181 Data Wrangling/cleaned_data_10.29.26.xlsx",
+  sheet = "county level data",
+  col_types = "text"
+)
+dim(natality_raw)
+names(natality_raw)
+head(natality_raw)
+
+rucc_raw <- read_excel(
+  "/Users/hellarinewu/Desktop/QBS 181 Data Wrangling/Ruralurbancontinuumcodes2023.xlsx",
+  sheet = "Rural-urban Continuum Code 2023",
+  col_types = "text"
+)
+dim(rucc_raw)
+names(rucc_raw)
+head(rucc_raw)
+
+#step 2, check the data structure on 2 dataset before we combine them, and make sure all the variables are in the correct structure
+glimpse(natality_raw)
+glimpse(rucc_raw)
+
+natality <- natality_raw
+rucc <- rucc_raw
+
+## loop1 for natality
+numeric_columns <- names(
+  dplyr::select(natality, Births:dplyr::last_col())
+)
+
+for (column in names(natality)) {
+
+  if (column %in% numeric_columns) {
+    natality[[column]] <- as.numeric(natality[[column]])
+
+  } else if (column == "Census_Region_of_Residence") {
+    natality[[column]] <- factor(
+      natality[[column]],
+      levels = as.character(1:4),
+      labels = c("Northeast", "Midwest", "South", "West")
+    )
+
+  } else if (column == "Census_Division_of_Residence") {
+    natality[[column]] <- factor(
+      natality[[column]],
+      levels = as.character(1:9),
+      labels = c(
+        "New England", "Middle Atlantic",
+        "East North Central", "West North Central",
+        "South Atlantic", "East South Central",
+        "West South Central", "Mountain", "Pacific"
+      )
+    )
+  }
+}
+
+## loop 2 for rucc
+for (column in names(rucc)) {
+
+  if (column == "Population_2020") {
+    rucc[[column]] <- as.numeric(rucc[[column]])
+
+  } else if (column == "RUCC_2023") {
+    rucc[[column]] <- factor(
+      rucc[[column]],
+      levels = as.character(1:9)
+    )
+  }
+}
+rucc <- rucc %>%
+  mutate(
+    metro_status = factor(
+      case_when(
+        as.character(RUCC_2023) %in% as.character(1:3) ~
+          "Metropolitan",
+        as.character(RUCC_2023) %in% as.character(4:9) ~
+          "Nonmetropolitan",
+        TRUE ~ NA_character_
+      ),
+      levels = c("Metropolitan", "Nonmetropolitan")
+    )
+  )
+
+glimpse(natality)
+glimpse(rucc)
+table(rucc$metro_status, useNA = "ifany")
+
+### look at 2 NAs
+rucc_missing <- rucc_raw %>%
+  filter(
+    FIPS %in% rucc$FIPS[is.na(rucc$metro_status)]
+  ) %>%
+  select(FIPS, State, County_Name, RUCC_2023, Description)
+
+print(rucc_missing, n = Inf, width = Inf)
+
+sapply(natality, class)
+
+#step 3, standardize the FIPS identifiers
+natality <- natality %>%
+  mutate(
+    state_fips = str_pad(
+      str_trim(State_of_Residence_Code),
+      width = 2, side = "left", pad = "0"
+    ),
+    fips = str_pad(
+      str_trim(County_of_Residence_Code),
+      width = 5, side = "left", pad = "0"
+    )
+  )
+
+rucc <- rucc %>%
+  mutate(
+    fips = str_pad(
+      str_trim(FIPS),
+      width = 5, side = "left", pad = "0"
+    )
+  )
+
+## data validation: check natality codes for missing values, incorrect formate or state code mismatches
+fips_issues <- natality %>%
+  filter(
+    is.na(fips) |
+      is.na(state_fips) |
+      !str_detect(fips, "^[0-9]{5}$") |
+      !str_detect(state_fips, "^[0-9]{2}$") |
+      str_sub(fips, 1, 2) != state_fips
+  ) %>%
+  select(
+    State_of_Residence,
+    County_of_Residence,
+    County_of_Residence_Code,
+    state_fips,
+    fips
+  )
+
+print(fips_issues, n = Inf, width = Inf)
+
+natality <- natality %>%
+  mutate(
+    fips = case_when(
+      State_of_Residence == "Arkansas" &
+        County_of_Residence == "Benton County, AR" &
+        fips == "00005" ~ "05007",
+      TRUE ~ fips
+    )
+  )
+natality %>%
+  filter(
+    State_of_Residence == "Arkansas",
+    County_of_Residence == "Benton County, AR"
+  ) %>%
+  select(
+    County_of_Residence,
+    County_of_Residence_Code,
+    state_fips,
+    fips
+  )
+
+
+natality <- natality %>%
+  mutate(
+    is_pooled = str_detect(
+      County_of_Residence,
+      "^Unidentified Counties"
+    )
+  )
+print(natality %>% count(is_pooled))
+natality_pooled <- natality %>%
+  filter(is_pooled)
+natality_counties <- natality %>%
+  filter(!is_pooled)
+nrow(natality_pooled)
+nrow(natality_counties)
+
+analysis_vars <- c(
+  "fips",
+  "State_of_Residence",
+  "County_of_Residence",
+  "Census_Region_of_Residence",
+  "Births",
+  "Average_Age_of_Mother",
+  "Average Pre-pregnancy BMI",
+  "Average Birth Weight (grams)",
+  "Average_OE_Gestational_Age",
+  "Average Number of Prenatal Visits"
+)
+
+### check for missing variables
+missing_summary <- data.frame(
+  variable = analysis_vars,
+  n_missing = colSums(
+    is.na(natality_counties[analysis_vars])
+  ),
+  row.names = NULL
+)
+
+print(missing_summary, row.names = FALSE)
+
+## now we check which natality counties lack a matching rucc FIPS code
+unmatched_counties <- natality_counties %>%
+  anti_join(rucc, by = "fips") %>%
+  select(
+    State_of_Residence,
+    County_of_Residence,
+    fips
+  )
+
+print(unmatched_counties, n = Inf)
+nrow(unmatched_counties)
+
+#step 4, join rucc onto the natality data
+natality_linked <- natality_counties %>%
+  left_join(
+    rucc %>%
+      select(fips, RUCC_2023, metro_status),
+    by = "fips"
+  )
+nrow(natality_linked)
+print(
+  natality_linked %>%
+    count(metro_status, .drop = FALSE)
+)
+natality_linked <- natality_linked %>%
+  mutate(
+    RUCC_2023 = factor(
+      as.character(RUCC_2023),
+      levels = as.character(1:9)
+    )
+  )
+
+print(
+  natality_linked %>%
+    count(RUCC_2023, .drop = FALSE),
+  n = Inf
+)
+
+#step 5 create our analysis datafile
+## make sure the variables are in the correct range before analyse the data
+measurement_vars <- c(
+  "Births",
+  "Average_Age_of_Mother",
+  "Average Pre-pregnancy BMI",
+  "Average Birth Weight (grams)",
+  "Average_OE_Gestational_Age",
+  "Average Number of Prenatal Visits"
+)
+
+range_summary <- data.frame(
+  variable = measurement_vars,
+  minimum = sapply(
+    natality_linked[measurement_vars],
+    min,
+    na.rm = TRUE
+  ),
+  maximum = sapply(
+    natality_linked[measurement_vars],
+    max,
+    na.rm = TRUE
+  ),
+  row.names = NULL
+)
+
+print(range_summary, row.names = FALSE)
+
+analysis_data <- natality_linked %>%
+  select(
+    county_fips = fips,
+    state_fips,
+    state = State_of_Residence,
+    county = County_of_Residence,
+    region = Census_Region_of_Residence,
+    division = Census_Division_of_Residence,
+    births = Births,
+    maternal_age = Average_Age_of_Mother,
+    prepregnancy_bmi = `Average Pre-pregnancy BMI`,
+    birth_weight_g = `Average Birth Weight (grams)`,
+    gestational_age_oe_weeks = Average_OE_Gestational_Age,
+    prenatal_visits = `Average Number of Prenatal Visits`,
+    rucc_2023 = RUCC_2023,
+    metro_status
+  )
+
+glimpse(analysis_data)
+
+core_vars <- setdiff(
+  names(analysis_data),
+  c("rucc_2023", "metro_status")
+)
+
+final_checks <- data.frame(
+  counties = nrow(analysis_data),
+  unique_fips = n_distinct(analysis_data$county_fips),
+  missing_core_values = sum(is.na(analysis_data[core_vars])),
+  missing_rucc = sum(is.na(analysis_data$rucc_2023)),
+  missing_metro = sum(is.na(analysis_data$metro_status)),
+  missing_rurality_outside_CT = sum(
+    analysis_data$state != "Connecticut" &
+      (
+        is.na(analysis_data$rucc_2023) |
+          is.na(analysis_data$metro_status)
+      )
+  ),
+  pooled_rows = sum(
+    str_detect(analysis_data$county, "^Unidentified Counties")
+  )
+)
+
+print(final_checks, row.names = FALSE)
+
+#save the analysis file in rds format
+output_file <- paste0(
+  "/Users/hellarinewu/Desktop/QBS 181 Data Wrangling/",
+  "analysis_data_2024_rucc2023.rds"
+)
+```
+
+# Aim 1. Describe geographic differences in maternal characteristics and birth outcomes among individually identified US counties in 2024
+
+## 1.1: Compare county averages for maternal age, prepregnancy BMI, birth weight, and obstetric-estimate gestational age across the four Census regions using summary tables and boxplots. Examine metropolitan–nonmetropolitan differences using the 2023 rucc where sufficient counties are available
+```{r}
+# region table summary
+regional_summary <- analysis_data %>%
+  select(
+    region,
+    maternal_age,
+    prepregnancy_bmi,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = -region,
+    names_to = "measure",
+    values_to = "county_average"
+  ) %>%
+  group_by(region, measure) %>%
+  summarise(
+    n_counties = n(),
+    mean = mean(county_average),
+    sd = sd(county_average),
+    median = median(county_average),
+    iqr = IQR(county_average),
+    .groups = "drop"
+  )
+
+print(regional_summary, n = Inf, width = Inf)
+
+# regional boxplots
+aim1_long <- analysis_data %>%
+  select(
+    region,
+    maternal_age,
+    prepregnancy_bmi,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = -region,
+    names_to = "measure",
+    values_to = "county_average"
+  ) %>%
+  mutate(
+    measure = factor(
+      measure,
+      levels = c(
+        "maternal_age",
+        "prepregnancy_bmi",
+        "birth_weight_g",
+        "gestational_age_oe_weeks"
+      ),
+      labels = c(
+        "Maternal age (years)",
+        "Prepregnancy BMI",
+        "Birth weight (grams)",
+        "OE gestational age (weeks)"
+      )
+    )
+  )
+
+
+regional_plot <- ggplot(
+  aim1_long,
+  aes(x = region, y = county_average)
+) +
+  geom_boxplot(
+    width = 0.6,
+    fill = "lightyellow",
+    outlier.shape = NA
+  ) +
+  geom_point(
+    position = position_jitter(
+      width = 0.15,
+      height = 0,
+      seed = 181
+    ),
+    alpha = 0.35,
+    size = 1,
+    color = "violet"
+  ) +
+  facet_wrap(
+    ~ measure,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  labs(
+    title = "County averages by Census region (2024)",
+    x = "Census region",
+    y = "County average",
+    caption = "Each point represents one county, counties receive equal weight"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+print(regional_plot)
+
+# rurality table
+rurality_by_region <- analysis_data %>%
+  count(
+    region,
+    metro_status,
+    .drop = FALSE
+  )
+print(rurality_by_region, n = Inf)
+
+rurality_summary <- analysis_data %>%
+  filter(!is.na(metro_status)) %>%
+  select(
+    metro_status,
+    maternal_age,
+    prepregnancy_bmi,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = -metro_status,
+    names_to = "measure",
+    values_to = "county_average"
+  ) %>%
+  group_by(metro_status, measure) %>%
+  summarise(
+  n_counties = n(),
+  mean = mean(county_average),
+  sd = sd(county_average),
+  median = median(county_average),
+  q1 = quantile(county_average, 0.25, names = FALSE),
+  q3 = quantile(county_average, 0.75, names = FALSE),
+  .groups = "drop")
+  
+print(rurality_summary, n = Inf, width = Inf)
+
+# rurality boxplot
+
+rurality_long <- analysis_data %>%
+  filter(!is.na(metro_status)) %>%
+  select(
+    metro_status,
+    maternal_age,
+    prepregnancy_bmi,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = -metro_status,
+    names_to = "measure",
+    values_to = "county_average"
+  ) %>%
+  mutate(
+    measure = factor(
+      measure,
+      levels = c(
+        "maternal_age",
+        "prepregnancy_bmi",
+        "birth_weight_g",
+        "gestational_age_oe_weeks"
+      ),
+      labels = c(
+        "Maternal age (years)",
+        "Prepregnancy BMI",
+        "Birth weight (grams)",
+        "OE gestational age (weeks)"
+      )
+    )
+  )
+
+rurality_plot <- ggplot(
+  rurality_long,
+  aes(x = metro_status, y = county_average)
+) +
+  geom_boxplot(
+    width = 0.5,
+    fill = "lightgreen",
+    outlier.shape = NA
+  ) +
+  geom_point(
+    position = position_jitter(
+      width = 0.15,
+      height = 0,
+      seed = 181
+    ),
+    color = "lightblue",
+    alpha = 0.4,
+    size = 1
+  ) +
+  facet_wrap(
+    ~ measure,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  labs(
+    title = "County averages by metropolitan status (2024)",
+    subtitle = "550 metropolitan counties and 20 nonmetropolitan counties",
+    x = "2023 RUCC metropolitan status",
+    y = "County average",
+    caption = "Each point represents one county, 8 Connecticut counties are excluded"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+print(rurality_plot)
+
+
+```
+
+
+## 1.2: Identify counties with relatively low or high average birth weight and gestational age, defined as values at or below the 10th percentile or at or above the 90th percentile among included counties. Use labeled plots to display these counties and describe their regional and rurality distributions
+```{r}
+# reginal birth-weighting comparison table
+
+regional_weighted_summary <- analysis_data %>%
+  select(
+    region,
+    births,
+    maternal_age,
+    prepregnancy_bmi,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = c(
+      maternal_age,
+      prepregnancy_bmi,
+      birth_weight_g,
+      gestational_age_oe_weeks
+    ),
+    names_to = "measure",
+    values_to = "county_average"
+  ) %>%
+  group_by(region, measure) %>%
+  summarise(
+    n_counties = n(),
+    total_births = sum(births),
+    unweighted_mean = mean(county_average),
+    birth_weighted_mean = weighted.mean(
+      county_average,
+      w = births
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    difference = birth_weighted_mean - unweighted_mean
+  )
+
+print(regional_weighted_summary, n = Inf, width = Inf)
+
+# rurality birth-weighting comparison table
+aim1_vars <- c(
+  "maternal_age",
+  "prepregnancy_bmi",
+  "birth_weight_g",
+  "gestational_age_oe_weeks"
+)
+
+rurality_weighted_summary <- analysis_data %>%
+  filter(!is.na(metro_status)) %>%
+  select(metro_status, births, all_of(aim1_vars)) %>%
+  pivot_longer(
+    cols = all_of(aim1_vars),
+    names_to = "measure",
+    values_to = "county_average"
+  ) %>%
+  group_by(metro_status, measure) %>%
+  summarise(
+    n_counties = n(),
+    total_births = sum(births),
+    unweighted_mean = mean(county_average),
+    birth_weighted_mean = weighted.mean(
+      county_average,
+      w = births
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    difference = birth_weighted_mean - unweighted_mean
+  )
+
+print(rurality_weighted_summary, n = Inf, width = Inf)
+
+# identifying counties with relatively low or high birth weight and gestational age
+aim1_cutoffs <- analysis_data %>%
+  summarise(
+    birth_weight_p10 = quantile(
+      birth_weight_g, 0.10, names = FALSE
+    ),
+    birth_weight_p90 = quantile(
+      birth_weight_g, 0.90, names = FALSE
+    ),
+    gestational_age_p10 = quantile(
+      gestational_age_oe_weeks, 0.10, names = FALSE
+    ),
+    gestational_age_p90 = quantile(
+      gestational_age_oe_weeks, 0.90, names = FALSE
+    )
+  )
+
+print(as.data.frame(aim1_cutoffs), row.names = FALSE)
+
+aim1_county_groups <- analysis_data %>%
+  mutate(
+    birth_weight_group = case_when(
+      birth_weight_g <= aim1_cutoffs$birth_weight_p10 ~
+        "Relatively low",
+      birth_weight_g >= aim1_cutoffs$birth_weight_p90 ~
+        "Relatively high",
+      TRUE ~ "Middle"
+    ),
+
+    gestational_age_group = case_when(
+      gestational_age_oe_weeks <=
+        aim1_cutoffs$gestational_age_p10 ~ "Relatively low",
+      gestational_age_oe_weeks >=
+        aim1_cutoffs$gestational_age_p90 ~ "Relatively high",
+      TRUE ~ "Middle"
+    )
+  ) %>%
+  mutate(
+    across(
+      c(birth_weight_group, gestational_age_group),
+      ~ factor(
+        .x,
+        levels = c("Relatively low", "Middle", "Relatively high")
+      )
+    )
+  )
+
+print(
+  aim1_county_groups %>%
+    count(birth_weight_group, .drop = FALSE)
+)
+
+print(
+  aim1_county_groups %>%
+    count(gestational_age_group, .drop = FALSE)
+)
+
+aim1_county_groups <- analysis_data %>%
+  mutate(
+    birth_weight_group = case_when(
+      birth_weight_g <= aim1_cutoffs$birth_weight_p10 ~
+        "Relatively low",
+      birth_weight_g >= aim1_cutoffs$birth_weight_p90 ~
+        "Relatively high",
+      TRUE ~ "Middle"
+    ),
+
+    gestational_age_group = case_when(
+      gestational_age_oe_weeks <=
+        aim1_cutoffs$gestational_age_p10 ~ "Relatively low",
+      gestational_age_oe_weeks >=
+        aim1_cutoffs$gestational_age_p90 ~ "Relatively high",
+      TRUE ~ "Middle"
+    )
+  ) %>%
+  mutate(
+    across(
+      c(birth_weight_group, gestational_age_group),
+      ~ factor(
+        .x,
+        levels = c("Relatively low", "Middle", "Relatively high")
+      )
+    )
+  )
+
+print(
+  aim1_county_groups %>%
+    count(birth_weight_group, .drop = FALSE)
+)
+
+print(
+  aim1_county_groups %>%
+    count(gestational_age_group, .drop = FALSE)
+)
+```
+# draw the map
+```{r}
+options(tigris_use_cache = TRUE)
+county_boundaries <- tigris::counties(
+  cb = TRUE,
+  resolution = "20m",
+  year = 2021
+) %>%
+  filter(as.integer(STATEFP) <= 56)
+map_unmatched <- aim1_county_groups %>%
+  anti_join(
+    county_boundaries %>%
+      st_drop_geometry() %>%
+      select(GEOID),
+    by = c("county_fips" = "GEOID")
+  ) %>%
+  select(county, county_fips)
+
+print(map_unmatched, n = Inf)
+
+county_map_data <- county_boundaries %>%
+  select(GEOID, STATEFP) %>%
+  left_join(
+    aim1_county_groups %>%
+      select(
+        county_fips,
+        birth_weight_group,
+        gestational_age_group
+      ),
+    by = c("GEOID" = "county_fips")
+  ) %>%
+  tigris::shift_geometry(
+    geoid_column = "GEOID",
+    preserve_area = FALSE
+  )
+
+state_borders <- county_map_data %>%
+  group_by(STATEFP) %>%
+  summarise(.groups = "drop")
+
+map_panels <- bind_rows(
+  county_map_data %>%
+    mutate(
+      outcome = "Average birth weight",
+      category = as.character(birth_weight_group)
+    ),
+  county_map_data %>%
+    mutate(
+      outcome = "Average OE gestational age",
+      category = as.character(gestational_age_group)
+    )
+) %>%
+  mutate(
+    category = replace_na(
+      category,
+      "No individual county data"
+    ),
+    category = factor(
+      category,
+      levels = c(
+        "Relatively low",
+        "Middle",
+        "Relatively high",
+        "No individual county data"
+      )
+    )
+  )
+
+
+aim1_map <- ggplot(map_panels) +
+  geom_sf(
+    aes(fill = category),
+    color = "white",
+    linewidth = 0.03
+  ) +
+  geom_sf(
+    data = state_borders,
+    fill = NA,
+    color = "gray",
+    linewidth = 0.15
+  ) +
+  facet_wrap(~ outcome, ncol = 1) +
+  scale_fill_manual(
+    values = c(
+      "Relatively low" = "orange",
+      "Middle" = "lightyellow",
+      "Relatively high" = "blue",
+      "No individual county data" = "lightgray"
+    ),
+    drop = FALSE,
+    name = NULL
+  ) +
+  coord_sf(datum = NA) +
+  labs(
+    title = "Geographic patterns in county-average birth outcomes (2024)"
+  ) +
+  theme_void(base_size = 10) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 6),
+    plot.title = element_text(face = "bold"),
+    plot.caption = element_text(hjust = 0)
+  )
+## Counties with fewer than 100000 residents are pooled within states in the source data and cannot be mapped individually. Colored counties represent the 578 individually identified counties
+print(aim1_map)
+```
+
+# Aim 2. Explore county-level relationships between prenatal visits, maternal characteristics, and birth outcomes in 2024
+
+## 2.1: Use scatterplots to examine associations between average prenatal visits and average birth weight and obstetric-estimate gestational age. Compare patterns across Census regions and, where sample sizes permit, metropolitan and nonmetropolitan counties
+```{r}
+aim2_scatter_data <- analysis_data %>%
+  select(
+    county,
+    region,
+    prenatal_visits,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = c(
+      birth_weight_g,
+      gestational_age_oe_weeks
+    ),
+    names_to = "outcome",
+    values_to = "county_average"
+  ) %>%
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c(
+        "birth_weight_g",
+        "gestational_age_oe_weeks"
+      ),
+      labels = c(
+        "Average birth weight (grams)",
+        "Average OE gestational age (weeks)"
+      )
+    )
+  )
+
+prenatal_scatter_plot <- ggplot(
+  aim2_scatter_data,
+  aes(
+    x = prenatal_visits,
+    y = county_average,
+    color = region
+  )
+) +
+  geom_point(alpha = 0.55, size = 1.4) +
+  facet_wrap(
+    ~ outcome,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Prenatal visits and county-average birth outcomes",
+    x = "Average number of prenatal visits",
+    y = NULL,
+    color = "Census region",
+    caption = "Each point represents one county; counties receive equal weight."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+print(prenatal_scatter_plot)
+
+
+
+
+
+
+
+# seperate plots
+regional_prenatal_plot <- ggplot(
+  aim2_scatter_data,
+  aes(
+    x = prenatal_visits,
+    y = county_average,
+    color = region
+  )
+) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  facet_grid(
+    outcome ~ region,
+    scales = "free_y",
+    labeller = label_wrap_gen(width = 18)
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Prenatal visits and birth outcomes by Census region",
+    x = "Average number of prenatal visits",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    strip.text.y = element_text(angle = 0)
+  )
+
+print(regional_prenatal_plot)
+
+
+# rurality comparison
+rurality_scatter_data <- analysis_data %>%
+  filter(!is.na(metro_status)) %>%
+  select(
+    metro_status,
+    prenatal_visits,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = c(
+      birth_weight_g,
+      gestational_age_oe_weeks
+    ),
+    names_to = "outcome",
+    values_to = "county_average"
+  )
+
+rurality_prenatal_plot <- ggplot(
+  rurality_scatter_data,
+  aes(
+    x = prenatal_visits,
+    y = county_average,
+    color = metro_status
+  )
+) +
+  geom_point(alpha = 0.5, size = 1.4) +
+  facet_grid(
+    outcome ~ metro_status,
+    scales = "free_y",
+    labeller = labeller(
+      outcome = c(
+        birth_weight_g = "Birth weight\n(grams)",
+        gestational_age_oe_weeks = "OE gestational\nage (weeks)"
+      )
+    )
+  ) +
+  scale_color_manual(
+    values = c(
+      "Metropolitan" = "darkblue",
+      "Nonmetropolitan" = "darkorange"
+    )
+  ) +
+  labs(
+    title = "Prenatal visits and birth outcomes by metropolitan status",
+    subtitle = "550 metropolitan counties; 20 nonmetropolitan counties",
+    x = "Average number of prenatal visits",
+    y = NULL,
+    caption = "Each point represents one county. Eight Connecticut counties are excluded."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    strip.text.y = element_text(angle = 0)
+  )
+
+print(rurality_prenatal_plot)
+```
+
+
+## 2.2: Divide counties into lower, middle, and upper thirds based on average prenatal visits. Compare maternal age, prepregnancy BMI, birth weight, and gestational age across these groups using summary tables and boxplots. Use the same group cutoffs across regions to examine whether differences are consistent within regions.
+```{r}
+prenatal_cutoffs <- analysis_data %>%
+  summarise(
+    lower_cutoff = quantile(
+      prenatal_visits, 1 / 3, names = FALSE
+    ),
+    upper_cutoff = quantile(
+      prenatal_visits, 2 / 3, names = FALSE
+    )
+  )
+
+print(as.data.frame(prenatal_cutoffs), row.names = FALSE)
+
+aim2_data <- analysis_data %>%
+  mutate(
+    prenatal_group = factor(
+      case_when(
+        prenatal_visits <= prenatal_cutoffs$lower_cutoff ~
+          "Lower third",
+        prenatal_visits <= prenatal_cutoffs$upper_cutoff ~
+          "Middle third",
+        TRUE ~ "Upper third"
+      ),
+      levels = c(
+        "Lower third",
+        "Middle third",
+        "Upper third"
+      )
+    )
+  )
+
+prenatal_group_check <- aim2_data %>%
+  group_by(prenatal_group) %>%
+  summarise(
+    n_counties = n(),
+    min_visits = min(prenatal_visits),
+    max_visits = max(prenatal_visits),
+    .groups = "drop"
+  )
+
+print(prenatal_group_check, width = Inf)
+
+#comaprison table
+aim2_group_summary <- aim2_data %>%
+  select(
+    prenatal_group,
+    maternal_age,
+    prepregnancy_bmi,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = -prenatal_group,
+    names_to = "measure",
+    values_to = "county_average"
+  ) %>%
+  group_by(prenatal_group, measure) %>%
+  summarise(
+    n_counties = n(),
+    mean = mean(county_average),
+    sd = sd(county_average),
+    median = median(county_average),
+    q1 = quantile(county_average, 0.25, names = FALSE),
+    q3 = quantile(county_average, 0.75, names = FALSE),
+    .groups = "drop"
+  )
+
+print(aim2_group_summary, n = Inf, width = Inf)
+
+#plot by perinatal visit
+aim2_group_long <- aim2_data %>%
+  select(
+    prenatal_group,
+    maternal_age,
+    prepregnancy_bmi,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = -prenatal_group,
+    names_to = "measure",
+    values_to = "county_average"
+  ) %>%
+  mutate(
+    measure = factor(
+      measure,
+      levels = c(
+        "maternal_age",
+        "prepregnancy_bmi",
+        "birth_weight_g",
+        "gestational_age_oe_weeks"
+      ),
+      labels = c(
+        "Maternal age (years)",
+        "Prepregnancy BMI",
+        "Birth weight (grams)",
+        "OE gestational age (weeks)"
+      )
+    )
+  )
+
+prenatal_group_plot <- ggplot(
+  aim2_group_long,
+  aes(x = prenatal_group, y = county_average)
+) +
+  geom_boxplot(
+    width = 0.6,
+    fill = "lightblue",
+    outlier.shape = NA
+  ) +
+  geom_point(
+    position = position_jitter(
+      width = 0.15,
+      height = 0,
+      seed = 181
+    ),
+    alpha = 0.35,
+    size = 1,
+    color = "darkblue"
+  ) +
+  facet_wrap(~ measure, scales = "free_y", ncol = 2) +
+  labs(
+    title = "County averages by prenatal-visit group",
+    x = "Prenatal-visit group",
+    y = "County average",
+    caption = paste(
+      "Each point represents one county.",
+      "Group sizes: lower 193; middle 192; upper 193"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+print(prenatal_group_plot)
+
+
+# by region
+region_group_counts <- aim2_data %>%
+  count(
+    region,
+    prenatal_group,
+    .drop = FALSE
+  ) %>%
+  group_by(region) %>%
+  mutate(
+    percent_within_region = 100 * n / sum(n)
+  ) %>%
+  ungroup()
+
+print(region_group_counts, n = Inf, width = Inf)
+
+#compare group means by region
+region_group_summary <- aim2_data %>%
+  group_by(region, prenatal_group) %>%
+  summarise(
+    n_counties = n(),
+    mean_maternal_age = mean(maternal_age),
+    mean_bmi = mean(prepregnancy_bmi),
+    mean_birth_weight_g = mean(birth_weight_g),
+    mean_ga_weeks = mean(gestational_age_oe_weeks),
+    .groups = "drop"
+  )
+
+print(region_group_summary, n = Inf, width = Inf)
+
+# plot birth outcomes by region
+aim2_region_long <- aim2_data %>%
+  select(
+    region,
+    prenatal_group,
+    birth_weight_g,
+    gestational_age_oe_weeks
+  ) %>%
+  pivot_longer(
+    cols = c(
+      birth_weight_g,
+      gestational_age_oe_weeks
+    ),
+    names_to = "outcome",
+    values_to = "county_average"
+  ) %>%
+  mutate(
+    outcome = factor(
+      outcome,
+      levels = c(
+        "birth_weight_g",
+        "gestational_age_oe_weeks"
+      ),
+      labels = c(
+        "Birth weight\n(grams)",
+        "OE gestational\nage (weeks)"
+      )
+    )
+  )
+
+region_group_plot <- ggplot(
+  aim2_region_long,
+  aes(x = prenatal_group, y = county_average)
+) +
+  geom_boxplot(
+    fill = "lightblue",
+    width = 0.6,
+    outlier.shape = NA
+  ) +
+  geom_point(
+    aes(color = region),
+    position = position_jitter(
+      width = 0.15,
+      height = 0,
+      seed = 181
+    ),
+    alpha = 0.4,
+    size = 0.8
+  ) +
+  facet_grid(outcome ~ region, scales = "free_y") +
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_discrete(
+    labels = c(
+      "Lower third" = "Lower\nthird",
+      "Middle third" = "Middle\nthird",
+      "Upper third" = "Upper\nthird"
+    )
+  ) +
+  labs(
+    title = "Birth outcomes by prenatal-visit group within regions",
+    x = "Prenatal-visit group",
+    y = NULL,
+    caption = "Groups use the same overall cutoffs across all regions."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    strip.text.y = element_text(angle = 0)
+  )
+
+print(region_group_plot)
+
+gestational_age_detail <- region_group_summary %>%
+  select(
+    region,
+    prenatal_group,
+    n_counties,
+    mean_ga_weeks
+  ) %>%
+  mutate(
+    mean_ga_weeks = sprintf("%.3f", mean_ga_weeks)
+  )
+
+print(gestational_age_detail, n = Inf)
+```
+
+# save everything in local file
+```{r}
+output_root <- paste0(
+  "/Users/hellarinewu/Desktop/QBS 181 Data Wrangling/",
+  "project_outputs"
+)
+
+save_aim_outputs <- function(aim_name, data, tables, plots) {
+
+  aim_dir <- file.path(output_root, aim_name)
+  dir.create(aim_dir, recursive = TRUE, showWarnings = FALSE)
+  saveRDS(
+    list(data = data, tables = tables),
+    file = file.path(aim_dir, paste0(aim_name, "_results.rds"))
+  )
+  for (table_name in names(tables)) {
+    write.csv(
+      tables[[table_name]],
+      file = file.path(aim_dir, paste0(table_name, ".csv")),
+      row.names = FALSE
+    )
+  }
+  for (plot_name in names(plots)) {
+    ggsave(
+      filename = file.path(aim_dir, paste0(plot_name, ".png")),
+      plot = plots[[plot_name]],
+      width = 14,
+      height = if (plot_name == "county_maps") 12 else 8,
+      units = "in",
+      dpi = 300,
+      bg = "white"
+    )
+  }
+}
+
+#aim 1
+aim1_tables <- list(
+  regional_summary = regional_summary,
+  rurality_summary = rurality_summary,
+  rurality_by_region = rurality_by_region,
+  regional_weighted_summary = regional_weighted_summary,
+  rurality_weighted_summary = rurality_weighted_summary,
+  percentile_cutoffs = aim1_cutoffs,
+  birth_weight_group_counts = aim1_county_groups %>%
+    count(birth_weight_group, .drop = FALSE),
+  gestational_age_group_counts = aim1_county_groups %>%
+    count(gestational_age_group, .drop = FALSE)
+)
+if (exists("region_tail_summary")) {
+  aim1_tables$region_tail_summary <- region_tail_summary
+}
+
+aim1_plots <- list(
+  regional_boxplots = regional_plot,
+  rurality_boxplots = rurality_plot,
+  county_maps = aim1_map
+)
+
+save_aim_outputs(
+  aim_name = "aim1",
+  data = aim1_county_groups,
+  tables = aim1_tables,
+  plots = aim1_plots
+)
+
+#aim 2
+aim2_tables <- list(
+  prenatal_cutoffs = prenatal_cutoffs,
+  prenatal_group_check = prenatal_group_check,
+  prenatal_group_summary = aim2_group_summary,
+  region_group_counts = region_group_counts,
+  region_group_summary = region_group_summary,
+  gestational_age_detail = gestational_age_detail
+)
+
+aim2_plots <- list(
+  overall_scatter = prenatal_scatter_plot,
+  regional_scatter = regional_prenatal_plot,
+  rurality_scatter = rurality_prenatal_plot,
+  prenatal_group_boxplots = prenatal_group_plot,
+  regional_group_boxplots = region_group_plot
+)
+
+save_aim_outputs(
+  aim_name = "aim2",
+  data = aim2_data,
+  tables = aim2_tables,
+  plots = aim2_plots
+)
+
+
+list.files(output_root, recursive = TRUE)
+```
+

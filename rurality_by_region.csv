@@ -1,0 +1,10 @@
+"region","metro_status","n"
+"Northeast","Metropolitan",95
+"Northeast","Nonmetropolitan",7
+"Northeast",NA,8
+"Midwest","Metropolitan",132
+"Midwest","Nonmetropolitan",5
+"South","Metropolitan",228
+"South","Nonmetropolitan",4
+"West","Metropolitan",95
+"West","Nonmetropolitan",4
