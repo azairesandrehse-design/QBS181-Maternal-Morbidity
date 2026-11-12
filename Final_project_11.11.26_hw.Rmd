@@ -19,7 +19,7 @@ library(sf)
 ```{r}
 #step 1, insert datasets. We will use the county level data as the analysis file. 
 natality_raw <- read_excel(
-  "/Users/hellarinewu/Desktop/QBS 181 Data Wrangling/cleaned_data_10.29.26.xlsx",
+  "cleaned_data_10.29.26.xlsx",
   sheet = "county level data",
   col_types = "text"
 )
@@ -28,7 +28,7 @@ names(natality_raw)
 head(natality_raw)
 
 rucc_raw <- read_excel(
-  "/Users/hellarinewu/Desktop/QBS 181 Data Wrangling/Ruralurbancontinuumcodes2023.xlsx",
+  "Ruralurbancontinuumcodes2023.xlsx",
   sheet = "Rural-urban Continuum Code 2023",
   col_types = "text"
 )
@@ -329,10 +329,8 @@ final_checks <- data.frame(
 print(final_checks, row.names = FALSE)
 
 #save the analysis file in rds format
-output_file <- paste0(
-  "/Users/hellarinewu/Desktop/QBS 181 Data Wrangling/",
-  "analysis_data_2024_rucc2023.rds"
-)
+output_file <- "analysis_data_2024_rucc2023.rds"
+saveRDS(analysis_data, output_file)
 ```
 
 # Aim 1. Describe geographic differences in maternal characteristics and birth outcomes among individually identified US counties in 2024
@@ -1244,7 +1242,6 @@ print(gestational_age_detail, n = Inf)
 # save everything in local file
 ```{r}
 output_root <- paste0(
-  "/Users/hellarinewu/Desktop/QBS 181 Data Wrangling/",
   "project_outputs"
 )
 
